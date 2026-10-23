@@ -1,0 +1,56 @@
+# Avvio remoto di Tweak Andrew, protetto da password. Si lancia con:
+#   irm tweak.pcfixproitalia.it | iex
+# Online c'e' solo il programma cifrato (tweak.bin, AES-256 con chiave dalla
+# password): senza password non serve a nulla. Decifrato resta in memoria e
+# non tocca il disco. Lo pubblica tools/pubblica.ps1.
+$TA_codice = & {
+    $ErrorActionPreference = 'Stop'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $sito = 'https://tweak.pcfixproitalia.it'
+    # Le versioni vecchie del lanciatore lasciavano qui il programma in chiaro.
+    Remove-Item -LiteralPath (Join-Path $env:TEMP 'Tweak_Andrew.ps1') -Force -ErrorAction SilentlyContinue
+
+    # Senza file da cui ripartire, si riapre PowerShell come amministratore e si riscarica.
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $admin) {
+        Write-Host 'Riapro PowerShell come amministratore...' -ForegroundColor Cyan
+        try { Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"irm $sito | iex`"" }
+        catch { Write-Host "ERRORE: avvio come amministratore non riuscito ($($_.Exception.Message))." -ForegroundColor Red }
+        return $null
+    }
+
+    Write-Host 'Scarico Tweak Andrew...' -ForegroundColor Cyan
+    try { $dati = (New-Object Net.WebClient).DownloadData("$sito/tweak.bin?$([DateTime]::UtcNow.Ticks)") }
+    catch { Write-Host "ERRORE: download non riuscito ($($_.Exception.Message))." -ForegroundColor Red; return $null }
+
+    # Formato: «TAE1», sale (16), IV (16), dati cifrati, HMAC-SHA256 (32) di tutto il resto.
+    function Open-Tweak([byte[]]$d, [string]$pw) {
+        if ($d.Length -lt 100 -or [Text.Encoding]::ASCII.GetString($d, 0, 4) -ne 'TAE1') { throw 'File non valido.' }
+        $salt = New-Object byte[] 16; [Array]::Copy($d, 4, $salt, 0, 16)
+        $iv = New-Object byte[] 16; [Array]::Copy($d, 20, $iv, 0, 16)
+        $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($pw, $salt, 300000, [Security.Cryptography.HashAlgorithmName]::SHA256)
+        $chiave = $kdf.GetBytes(64)
+        $ek = New-Object byte[] 32; [Array]::Copy($chiave, 0, $ek, 0, 32)
+        $mk = New-Object byte[] 32; [Array]::Copy($chiave, 32, $mk, 0, 32)
+        $mac = (New-Object Security.Cryptography.HMACSHA256 (, $mk)).ComputeHash($d, 0, $d.Length - 32)
+        for ($i = 0; $i -lt 32; $i++) { if ($mac[$i] -ne $d[$d.Length - 32 + $i]) { return $null } }
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $ek; $aes.IV = $iv
+        $chiaro = $aes.CreateDecryptor().TransformFinalBlock($d, 36, $d.Length - 36 - 32)
+        return [Text.Encoding]::UTF8.GetString($chiaro).TrimStart([char]0xFEFF)
+    }
+
+    for ($prova = 1; $prova -le 3; $prova++) {
+        $sec = Read-Host 'Password' -AsSecureString
+        $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+        try { $pw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+        try { $codice = Open-Tweak $dati $pw } catch { Write-Host "ERRORE: $($_.Exception.Message)" -ForegroundColor Red; return $null }
+        $pw = $null
+        if ($codice) { Write-Host 'OK: avvio.' -ForegroundColor Green; return $codice }
+        Write-Host 'Password errata.' -ForegroundColor Red
+    }
+    return $null
+}
+# Il programma gira nell'ambito principale, come se fosse aperto da file.
+if ($TA_codice) { $TA_c = $TA_codice; Remove-Variable TA_codice; Invoke-Expression $TA_c; Remove-Variable TA_c -ErrorAction SilentlyContinue }
+else { Remove-Variable TA_codice -ErrorAction SilentlyContinue }
